@@ -16,14 +16,11 @@ Then visit `http://localhost:8000`.
 
 The workflow at `.github/workflows/deploy.yml` publishes the root directory to GitHub Pages whenever a commit is pushed to `main`, and supports manual runs from the Actions tab.
 
-1. Create a GitHub repository and push these files to its `main` branch.
-2. In the repository, open **Settings → Pages** and set **Build and deployment → Source** to **GitHub Actions**.
-3. Wait for the **Deploy portfolio to GitHub Pages** workflow to finish. GitHub will show the Pages URL in the workflow deployment environment.
-4. Under **Custom domain**, enter `anannya.in` and save. With a custom GitHub Actions publishing workflow, GitHub stores this setting in Pages; the included `CNAME` file is harmless but not required.
+This site is deployed from [`anannya-git/anannya-portfolio`](https://github.com/anannya-git/anannya-portfolio). GitHub Pages is configured to use **GitHub Actions**, and the deploy workflow runs automatically when changes reach `main`. The custom domain `anannya.in` is configured in the repository's Pages settings.
 
 ## Connect `anannya.in` at GoDaddy
 
-In GoDaddy DNS management, point the apex domain to GitHub Pages with these A records:
+After GoDaddy completes registrant verification and unlocks DNS editing, point the apex domain to GitHub Pages with these A records:
 
 | Type | Name | Value |
 | --- | --- | --- |
@@ -32,6 +29,4 @@ In GoDaddy DNS management, point the apex domain to GitHub Pages with these A re
 | A | @ | 185.199.110.153 |
 | A | @ | 185.199.111.153 |
 
-For `www`, add a CNAME record with **Name** `www` and **Value** `<your-github-username>.github.io` (replace the placeholder with the GitHub Pages host shown for your account). Remove only DNS records that conflict with these hostnames; keep unrelated records, such as email MX records, intact. After DNS resolves, enable **Enforce HTTPS** under **Settings → Pages**.
-
-The site and workflow are prepared here, but GitHub repository publishing and GoDaddy DNS changes require access to those accounts.
+For `www`, set the CNAME target to `anannya-git.github.io`. Replace only conflicting `@` A and `www` CNAME records; preserve unrelated records such as email MX and TXT records. Once DNS resolves, enable **Enforce HTTPS** under **Settings → Pages** if GitHub has not enabled it automatically.
