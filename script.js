@@ -5,17 +5,250 @@
   const reduceQuery = matchMedia("(prefers-reduced-motion: reduce)");
   const sections = [...document.querySelectorAll("[data-shape]")];
 
+  /* ---------- Sound ---------- */
+
+  // Every sound is synthesised with Web Audio, so nothing is downloaded. Sound is
+  // off until the visitor turns it on (browsers block audio before a gesture);
+  // the choice is remembered. The particle loop writes `fx`; the audio loop reads it.
+  const fx = { cur: null, k: 0, f: 0, s: 0, yaw: 0, dist: 4, push: 0, cursorSpeed: 0, fly: 0, mx: 0.5 };
+  const sfx = (() => {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const toggle = document.querySelector(".sound-toggle");
+    if (!AC || !toggle) {
+      toggle?.remove();
+      return { tick() {}, thump() {}, chirp() {} };
+    }
+    let ctx = null, on = false, nodes = null, loopId = 0;
+    let lastY = scrollY, lastT = performance.now(), formed = null;
+    const NOTES = [220, 246.94, 293.66, 329.63, 392];   // A minor pentatonic, one per section
+    const stored = () => { try { return localStorage.getItem("sound") === "on"; } catch { return false; } };
+    const store = (v) => { try { localStorage.setItem("sound", v ? "on" : "off"); } catch {} };
+
+    function noiseBuffer(seconds) {
+      const b = ctx.createBuffer(1, ctx.sampleRate * seconds, ctx.sampleRate), d = b.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+      return b;
+    }
+    function noise() {
+      const s = ctx.createBufferSource();
+      s.buffer = nodes.noise;
+      s.loop = true;
+      s.start(0, Math.random() * 2);
+      return s;
+    }
+    function chain(...list) { for (let i = 0; i < list.length - 1; i++) list[i].connect(list[i + 1]); return list[list.length - 1]; }
+    function filter(type, freq, q = 0.7) { const f = ctx.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q; return f; }
+    function gain(v = 0) { const g = ctx.createGain(); g.gain.value = v; return g; }
+    const set = (param, v, tc = 0.12) => param.setTargetAtTime(v, ctx.currentTime, tc);
+
+    function build() {
+      ctx = new AC();
+      nodes = { noise: noiseBuffer(2) };
+      const master = gain(0), comp = ctx.createDynamicsCompressor();
+      master.connect(comp).connect(ctx.destination);
+      // A generated room: decaying noise as the reverb impulse.
+      const verb = ctx.createConvolver(), ir = ctx.createBuffer(2, ctx.sampleRate * 3, ctx.sampleRate);
+      for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 2.6); }
+      verb.buffer = ir;
+      const verbOut = gain(0.45);
+      verb.connect(verbOut).connect(master);
+
+      // Drone: three detuned low tones through a slowly breathing low-pass.
+      const padFilter = filter("lowpass", 360), padGain = gain(0.05);
+      [[55, 0, "sine"], [82.41, 6, "triangle"], [110, -5, "sine"]].forEach(([f, det, type]) => {
+        const o = ctx.createOscillator(); o.type = type; o.frequency.value = f; o.detune.value = det; o.connect(padFilter); o.start();
+      });
+      const lfo = ctx.createOscillator(), lfoAmt = gain(110);
+      lfo.frequency.value = 0.07; lfo.connect(lfoAmt).connect(padFilter.frequency); lfo.start();
+      padFilter.connect(padGain); padGain.connect(master); padGain.connect(verb);
+      const air = chain(noise(), filter("lowpass", 800), gain(0.01)); air.connect(master);
+
+      // Scroll wind, cursor shimmer and plane airflow are noise shaped by filters.
+      const windBand = filter("bandpass", 400, 0.9), windGain = gain(0);
+      chain(noise(), windBand, windGain); windGain.connect(master); windGain.connect(verb);
+      const sparkBand = filter("bandpass", 3800, 1.2), sparkGain = gain(0), sparkPan = ctx.createStereoPanner ? ctx.createStereoPanner() : gain(1);
+      chain(noise(), filter("highpass", 2400), filter("lowpass", 6000), sparkBand, sparkGain, sparkPan); sparkPan.connect(master); sparkPan.connect(verb);
+      const flightGain = gain(0), flightWobble = ctx.createOscillator(), wobbleAmt = gain(0.25);
+      chain(noise(), filter("lowpass", 650), flightGain).connect(master);
+      flightWobble.frequency.value = 0.3; flightWobble.connect(wobbleAmt);
+      const flightLevel = gain(0); wobbleAmt.connect(flightLevel.gain); flightWobble.start();
+
+      // Scroll-scrubbed layers. The morph swarm swells while a mascot dissolves and
+      // re-forms, panned with the camera; the tone glides between each section's note.
+      const morphBand = filter("lowpass", 600, 0.5), morphGain = gain(0), morphPan = ctx.createStereoPanner ? ctx.createStereoPanner() : gain(1);
+      chain(noise(), morphBand, morphGain, morphPan); morphPan.connect(master); morphPan.connect(verb);
+      const toneFilter = filter("lowpass", 900), toneGain = gain(0.018), tones = [];
+      [["sine", 0], ["triangle", 7]].forEach(([type, det]) => {
+        const o = ctx.createOscillator(); o.type = type; o.frequency.value = NOTES[0] / 2; o.detune.value = det; o.connect(toneFilter); o.start(); tones.push(o);
+      });
+      toneFilter.connect(toneGain); toneGain.connect(verb); toneGain.connect(master);
+
+      Object.assign(nodes, { master, verb, padFilter, windBand, windGain, sparkBand, sparkGain, sparkPan, flightGain, morphBand, morphGain, morphPan, toneFilter, tones });
+    }
+
+    // A mascot forming: a falling sub-bass boom, a low noise thud and a soft chord.
+    function boom(index) {
+      const t = ctx.currentTime, { master, verb } = nodes;
+      const sub = ctx.createOscillator(), subGain = gain(0);
+      sub.frequency.setValueAtTime(72, t); sub.frequency.exponentialRampToValueAtTime(36, t + 1.3);
+      subGain.gain.setValueAtTime(0, t); subGain.gain.linearRampToValueAtTime(0.22, t + 0.03); subGain.gain.exponentialRampToValueAtTime(0.0001, t + 1.8);
+      sub.connect(subGain); subGain.connect(master); subGain.connect(verb); sub.start(t); sub.stop(t + 1.9);
+      const thud = noise(), thudGain = gain(0);
+      thudGain.gain.setValueAtTime(0.12, t); thudGain.gain.exponentialRampToValueAtTime(0.0001, t + 0.5);
+      chain(thud, filter("lowpass", 220), thudGain); thudGain.connect(master); thud.stop(t + 0.6);
+      const root = NOTES[index % NOTES.length];
+      [1, 1.5, 2].forEach((m, i) => {
+        const o = ctx.createOscillator(), g = gain(0);
+        o.type = "sine"; o.frequency.value = root * m;
+        g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.03 / (i + 1), t + 0.25); g.gain.exponentialRampToValueAtTime(0.0001, t + 3.2);
+        o.connect(g); g.connect(verb); g.connect(master); o.start(t); o.stop(t + 3.3);
+      });
+    }
+
+    function loop(now) {
+      loopId = requestAnimationFrame(loop);
+      const dt = Math.max(0.001, (now - lastT) / 1000);
+      lastT = now;
+      const v = Math.abs(scrollY - lastY) / dt / innerHeight;   // screens per second
+      lastY = scrollY;
+      const { windBand, windGain, sparkBand, sparkGain, sparkPan, flightGain, padFilter } = nodes;
+      set(windGain.gain, Math.min(0.17, v * 0.07), 0.08);
+      set(windBand.frequency, 320 + Math.min(v, 4) * 520, 0.1);
+      const stir = fx.push * Math.min(1, fx.cursorSpeed / 700);
+      set(sparkGain.gain, Math.min(0.012, stir * 0.012), 0.12);
+      set(sparkBand.frequency, 3800 + Math.min(fx.cursorSpeed, 1500) * 0.4, 0.15);
+      if (sparkPan.pan) set(sparkPan.pan, (fx.mx - 0.5) * 1.4, 0.1);
+      set(flightGain.gain, fx.fly * 0.06, 0.4);
+      // Everything below follows scroll position, so it plays backwards when scrolling up.
+      const { morphBand, morphGain, morphPan, toneFilter, tones } = nodes;
+      const near = 4 / fx.dist;                                   // >1 when the camera pushes in
+      // A soft, dark breath of air rather than grit: low-passed and kept well under the music.
+      set(morphGain.gain, Math.min(0.07, fx.s * 0.045 * near), 0.12);
+      set(morphBand.frequency, Math.min(1400, 380 + fx.f * 700 * near), 0.12);
+      if (morphPan.pan) set(morphPan.pan, Math.max(-0.9, Math.min(0.9, Math.sin(fx.yaw) * 0.9)), 0.08);
+      const e = fx.f * fx.f * (3 - 2 * fx.f);
+      const pitch = (NOTES[fx.k % NOTES.length] + (NOTES[(fx.k + 1) % NOTES.length] - NOTES[fx.k % NOTES.length]) * e) / 2;
+      tones.forEach((o) => set(o.frequency, pitch, 0.06));
+      set(toneFilter.frequency, 500 + 900 * Math.min(1.8, near) + fx.s * 600, 0.08);
+      // The drone opens up as the visitor goes deeper into the site.
+      const cur = fx.cur ?? Math.round(scrollY / innerHeight);
+      set(padFilter.frequency, 320 + cur * 70, 0.6);
+      const nearest = Math.round(cur);
+      if (formed === null) formed = nearest;
+      if (Math.abs(cur - nearest) < 0.06 && nearest !== formed) { formed = nearest; boom(nearest); }
+    }
+
+    async function enable() {
+      if (!ctx) build();
+      await ctx.resume();
+      on = true;
+      formed = null;
+      lastY = scrollY; lastT = performance.now();
+      nodes.master.gain.cancelScheduledValues(ctx.currentTime);
+      set(nodes.master.gain, 0.8, 0.5);
+      cancelAnimationFrame(loopId);
+      loopId = requestAnimationFrame(loop);
+      paint();
+    }
+    function disable() {
+      on = false;
+      paint();
+      if (!ctx) return;
+      set(nodes.master.gain, 0, 0.15);
+      setTimeout(() => { if (!on) { cancelAnimationFrame(loopId); ctx.suspend(); } }, 700);
+    }
+    function paint() {
+      toggle.setAttribute("aria-pressed", String(on));
+      toggle.setAttribute("aria-label", on ? "Turn sound off" : "Turn sound on");
+      toggle.classList.toggle("is-on", on);
+    }
+    toggle.addEventListener("click", () => { const next = !on; store(next); next ? enable() : disable(); });
+    // A returning visitor who chose sound gets it back on their first interaction.
+    if (stored()) {
+      const resume = (e) => { if (!on && !toggle.contains(e.target)) enable(); };
+      addEventListener("pointerdown", resume, { once: true, capture: true });
+      addEventListener("keydown", resume, { once: true, capture: true });
+    }
+    document.addEventListener("visibilitychange", () => {
+      if (!ctx || !on) return;
+      document.hidden ? ctx.suspend() : ctx.resume();
+    });
+
+    return {
+      chirp(from, to) {
+        if (!on) return;
+        const t = ctx.currentTime, o = ctx.createOscillator(), g = gain(0);
+        o.type = "sine";
+        o.frequency.setValueAtTime(from, t); o.frequency.exponentialRampToValueAtTime(to, t + 0.12);
+        g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.03, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+        o.connect(g); g.connect(nodes.master); g.connect(nodes.verb); o.start(t); o.stop(t + 0.25);
+      },
+      tick() {
+        if (!on) return;
+        const t = ctx.currentTime, o = ctx.createOscillator(), g = gain(0);
+        o.frequency.value = 1900;
+        g.gain.setValueAtTime(0.025, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.04);
+        o.connect(g).connect(nodes.master); o.start(t); o.stop(t + 0.05);
+      },
+      thump() {
+        if (!on) return;
+        const t = ctx.currentTime, o = ctx.createOscillator(), g = gain(0);
+        o.frequency.setValueAtTime(110, t); o.frequency.exponentialRampToValueAtTime(55, t + 0.25);
+        g.gain.setValueAtTime(0.07, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.3);
+        o.connect(g); g.connect(nodes.master); g.connect(nodes.verb); o.start(t); o.stop(t + 0.32);
+      },
+    };
+  })();
+  document.querySelectorAll(".header-cta, .button, .main-nav a, .org, .org-title").forEach((el) =>
+    el.addEventListener("pointerenter", () => sfx.tick())
+  );
+
   /* ---------- Page chrome: reveal, rail ---------- */
 
-  sections.forEach((section) => {
-    section.querySelectorAll(".reveal").forEach((el, i) => el.style.setProperty("--i", i));
-  });
-
-  const revealer = new IntersectionObserver(
-    (entries) => entries.forEach((e) => e.isIntersecting && e.target.classList.add("in")),
-    { threshold: 0.15 }
-  );
-  sections.forEach((s) => revealer.observe(s));
+  // Scroll-linked text: each section's copy slides in from its own screen edge,
+  // fading from transparent to opaque, and leaves the same way. It follows the
+  // scroll position exactly, in both directions. Left-hand copy uses the left edge.
+  const blocks = sections.map((section) => ({
+    section,
+    dir: section.dataset.side === "right" ? -1 : 1,
+    items: [...section.querySelectorAll(".reveal")],
+    captions: [...section.querySelectorAll(".fig, .scroll-cue")],
+  }));
+  const smooth = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+  let textQueued = false;
+  function placeText() {
+    textQueued = false;
+    const vh = innerHeight, vw = innerWidth, still = reduceQuery.matches;
+    const travel = Math.min(vw * 0.42, 640);
+    const reads = blocks.map((b) => b.section.getBoundingClientRect());
+    blocks.forEach((b, s) => {
+      const r = reads[s];
+      // 0 while the section fills the screen; positive as it sits below (entering),
+      // negative as it leaves upward, in viewport heights.
+      const c = r.top > 0 ? r.top / vh : r.bottom < vh ? (r.bottom - vh) / vh : 0;
+      const n = b.items.length;
+      b.items.forEach((el, i) => {
+        // Stagger: on the way in the first item leads; on the way out the top item leaves first.
+        // The stagger grows with distance, so a section a pixel off its rest spot stays fully shown.
+        const lag = 0.035 * Math.min(1, Math.abs(c) / 0.12);
+        const ci = c > 0 ? c + i * lag : c < 0 ? c - (n - 1 - i) * lag : 0;
+        const shown = 1 - smooth(0.06, 0.46, Math.abs(ci));
+        el.style.opacity = shown.toFixed(3);
+        el.style.transform = still || shown > 0.999 ? "" : `translate3d(${(b.dir * travel * (1 - shown) * (1 - shown)).toFixed(1)}px, 0, 0)`;
+      });
+      // Captions (SCROLL, FIG.) leave through their own nearest edge, a beat after the copy.
+      b.captions.forEach((el) => {
+        const side = el.offsetLeft + el.offsetWidth / 2 < vw / 2 ? -1 : 1;
+        const shown = 1 - smooth(0.04, 0.34, Math.abs(c));
+        el.style.opacity = shown.toFixed(3);
+        el.style.transform = still || shown > 0.999 ? "" : `translate3d(${(side * travel * 0.6 * (1 - shown) * (1 - shown)).toFixed(1)}px, 0, 0)`;
+      });
+    });
+  }
+  const queueText = () => { if (!textQueued) { textQueued = true; requestAnimationFrame(placeText); } };
+  addEventListener("scroll", queueText, { passive: true });
+  addEventListener("resize", queueText);
+  placeText();
 
   const rail = document.querySelector(".rail");
   const railButtons = sections.map((section) => {
@@ -26,6 +259,7 @@
     b.addEventListener("click", () =>
       section.scrollIntoView({ behavior: reduceQuery.matches ? "auto" : "smooth" })
     );
+    b.addEventListener("pointerenter", () => sfx.tick());
     rail?.appendChild(b);
     return b;
   });
@@ -100,18 +334,23 @@
 
   function glideTo(target) {
     const from = scrollY, dist = target - from, t0 = performance.now();
+    let expected = from;
     gliding = true;
     const step = (now) => {
       if (!gliding) return;
+      // Something else moved the page (a link, the rail, a script): let it win.
+      if (Math.abs(scrollY - expected) > 2) { gliding = false; return; }
       const t = (now - t0) / 1000;
       // Critically damped spring from rest: x(t) = 1 - (1 + wt) e^(-wt).
       const k = 1 - (1 + OMEGA * t) * Math.exp(-OMEGA * t);
       if (Math.abs(dist) * (1 - k) < 0.4) {
+        sfx.thump();
         scrollTo({ top: target, behavior: "instant" });
         gliding = false;
         return;
       }
       scrollTo({ top: from + dist * k, behavior: "instant" });
+      expected = scrollY;
       glideFrame = requestAnimationFrame(step);
     };
     glideFrame = requestAnimationFrame(step);
@@ -332,12 +571,41 @@
     attribute vec4 aR;
     attribute float aD;
     uniform mat3 uRotA, uRotB, uCam;
-    uniform float uF, uScatter, uTime, uMotion, uScale, uPx, uSize, uDist, uFlyA, uFlyB;
+    uniform float uF, uScatter, uTime, uMotion, uScale, uPx, uSize, uDist, uFlyA, uFlyB, uPush, uHiA, uHiB;
+    uniform vec4 uPet;    // body: stretch, lean, hop, jitter
+    uniform vec3 uPet2;   // eye (the i's dot): lift, openness; arm (h's stem): wave angle
+    const int TRAIL = 16;
+    uniform vec3 uTrail[TRAIL];
     uniform vec2 uCenter, uRes, uMouse, uMouseVel;
     uniform vec3 uA1, uA2, uB1, uB2;
     varying vec3 vColor;
     varying float vAlpha;
     float hash(float n) { return fract(sin(n) * 43758.5453); }
+    // The "hi" as a character, in its own object space (baseline y = -1.25).
+    vec3 pet(vec3 p, float w) {
+      const float base = -1.25;
+      // Arm: the h's tall stem bends from its middle to wave.
+      if (p.x < -0.58) {
+        float a = uPet2.z * smoothstep(-0.2, 1.25, p.y);
+        vec2 pv = vec2(-0.78, -0.2), d = p.xy - pv;
+        p.xy = pv + vec2(d.x * cos(a) - d.y * sin(a), d.x * sin(a) + d.y * cos(a));
+      }
+      vec2 eye = vec2(0.77, 0.83);
+      if (length(p.xy - eye) < 0.32) {
+        // Eye: floats and blinks (squashes vertically).
+        p.y = eye.y + (p.y - eye.y) * uPet2.y + uPet2.x;
+      } else if (p.x > 0.55) {
+        // The i's stem overshoots the body's stretch a little: follow-through.
+        p.y = base + (p.y - base) * (1.0 + (uPet.x - 1.0) * 1.6);
+      }
+      // Squash and stretch from the baseline, keeping its volume.
+      float wide = inversesqrt(max(uPet.x, 0.2));
+      p = vec3(p.x * wide, base + (p.y - base) * uPet.x, p.z * wide);
+      p.x += uPet.y * (p.y - base) * 0.3;   // lean
+      p.y += uPet.z;                          // hop
+      p.xy += uPet.w * vec2(sin(uTime * 47.0 + w * 91.0), cos(uTime * 53.0 + w * 67.0));   // nervous shake
+      return p;
+    }
     // The plane flies along world +x at FLY_SPEED; the air (dust) streams past at that speed.
     const float FLY_SPEED = 2.4;
     float bob(float t) { return 0.07 * sin(1.3 * t); }
@@ -359,7 +627,8 @@
       float m = clamp((uF - w * 0.35) / 0.65, 0.0, 1.0);
       m = m * m * (3.0 - 2.0 * m);
       bool mascot = aD < 0.5;
-      vec3 pa = uRotA * aA, pb = uRotB * aB;
+      vec3 pa = uRotA * (uHiA > 0.5 && mascot ? pet(aA, w) : aA);
+      vec3 pb = uRotB * (uHiB > 0.5 && mascot ? pet(aB, w) : aB);
       if (uFlyA > 0.5 && mascot && aA.x < -0.96) pa = contrail(w, uRotA);
       if (uFlyB > 0.5 && mascot && aB.x < -0.96) pb = contrail(w, uRotB);
       vec3 p = mix(pa, pb, m);
@@ -378,17 +647,32 @@
       float gap = uDist - p.z;
       float persp = min(uDist / max(gap, 0.35), 3.0);
       vec2 sp = uCenter + vec2(p.x, -p.y) * uScale * persp;
-      vec2 d = sp - uMouse;
-      float dist = length(d);
-      // Natural push: soft falloff, uneven strength and a bent direction per particle,
-      // plus a wake that drags particles along with the cursor's motion.
+      // Natural push: soft falloff, uneven strength and a bent direction per particle.
+      // The cursor's recent path (uTrail: x, y, weight) keeps pushing with a fading
+      // weight, so particles are thrown aside instantly but drift back slowly.
       float r = 70.0 * uPx;
-      float fall = exp(-(dist * dist) / (r * r));
       float strength = 0.35 + 1.3 * fract(w * 7.31);
       float bend = (fract(w * 13.7) - 0.5) * 1.4;
-      vec2 dir = d / (dist + 0.001);
-      dir = vec2(dir.x * cos(bend) - dir.y * sin(bend), dir.x * sin(bend) + dir.y * cos(bend));
-      sp += (dir * 110.0 * uPx + uMouseVel * 0.8) * fall * strength * uMotion;
+      float cb = cos(bend), sb = sin(bend);
+      // Each point on the cursor's path pushes on its own; the strongest one wins.
+      // (Summing them would let a slow or resting cursor pile faded pushes back up.)
+      vec2 push = vec2(0.0);
+      float best = 0.0;
+      for (int i = 0; i < TRAIL; i++) {
+        vec3 t = uTrail[i];
+        if (t.z <= 0.001) continue;
+        vec2 d = sp - t.xy;
+        float dist = length(d);
+        float amt = exp(-(dist * dist) / (r * r)) * t.z;
+        if (amt > best) {
+          best = amt;
+          vec2 dir = d / (dist + 0.001);
+          push = vec2(dir.x * cb - dir.y * sb, dir.x * sb + dir.y * cb) * amt;
+        }
+      }
+      vec2 dm = sp - uMouse;
+      float wake = exp(-dot(dm, dm) / (r * r)) * uPush;
+      sp += (push * 60.0 * uPx + uMouseVel * 0.45 * wake) * strength * uMotion;
       vec2 clip = sp / uRes * 2.0 - 1.0;
       gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
       // Particles that pass the camera during a fly-through are hidden, not smeared.
@@ -433,7 +717,7 @@
 
   const loc = {};
   ["aA", "aB", "aR", "aD"].forEach((n) => (loc[n] = gl.getAttribLocation(prog, n)));
-  ["uRotA", "uRotB", "uCam", "uDist", "uFlyA", "uFlyB", "uF", "uScatter", "uTime", "uMotion", "uScale", "uPx", "uSize", "uCenter", "uRes", "uMouse", "uMouseVel", "uA1", "uA2", "uB1", "uB2"]
+  ["uRotA", "uRotB", "uCam", "uDist", "uFlyA", "uFlyB", "uF", "uScatter", "uTime", "uMotion", "uScale", "uPx", "uSize", "uCenter", "uRes", "uMouse", "uMouseVel", "uPush", "uTrail", "uHiA", "uHiB", "uPet", "uPet2", "uA1", "uA2", "uB1", "uB2"]
     .forEach((n) => (loc[n] = gl.getUniformLocation(prog, n)));
 
   const shapeNames = sections.map((s) => s.dataset.shape);
@@ -518,7 +802,11 @@
     return { x: frame + cw * at, y: H * 0.5 + 8, s: Math.min(cw * (W <= 1100 ? 0.15 : 0.16), H * 0.29) };
   }
 
-  const mouse = { x: -1e4, y: -1e4, nx: 0, ny: 0, sx: 0, sy: 0, px: -1e4, py: -1e4, vx: 0, vy: 0 };
+  // Push is instant; the return is slower (RETURN_RATE per second, over TRAIL_LIFE).
+  const TRAIL_N = 16, TRAIL_LIFE = 1.2, RETURN_RATE = 1.3;
+  const trail = [], trailData = new Float32Array(TRAIL_N * 3);
+  let trailClock = 0;
+  const mouse = { x: -1e4, y: -1e4, nx: 0, ny: 0, sx: 0, sy: 0, px: -1e4, py: -1e4, vx: 0, vy: 0, push: 0 };
   addEventListener("pointermove", (e) => {
     if (e.pointerType === "touch") return;
     mouse.x = e.clientX;
@@ -529,6 +817,98 @@
   document.addEventListener("pointerleave", () => { mouse.x = mouse.y = -1e4; });
 
   const ease = (x) => x * x * (3 - 2 * x);
+
+  /* ---------- The "hi" character ---------- */
+
+  // A tiny state machine plus springs: it breathes, blinks, looks at the cursor,
+  // waves, hops, startles and dozes off. petStep only runs while it is on screen.
+  const pet = {
+    sy: 1, sv: 0, lean: 0, lv: 0, hop: 0, hv: 0, dotY: 0, dv: 0, eye: 1, wave: 0, jitter: 0,
+    t: 0, nextBlink: 3.2, blinkT: -1, waveT: -1, introWaved: false, nextHop: 6, pendingHop: 0, hopAt: -1,
+    idle: 0, sleepy: 0, startleAt: -9, wasNear: false, awayFor: 0, lastCur: 0, greeted: false,
+  };
+  const petHop = (power) => { pet.sv -= 0.5 * power; pet.pendingHop = power; pet.hopAt = pet.t + 0.12; };
+  const petWave = () => { if (pet.waveT < 0 || pet.waveT > 1.6) { pet.waveT = 0; sfx.chirp(440, 660); } };
+  ["pointermove", "keydown", "wheel", "touchstart"].forEach((type) =>
+    addEventListener(type, () => {
+      if (pet.sleepy > 0.6) { pet.sv += 1.4; petWave(); }   // wakes with a stretch and a wave
+      pet.idle = 0;
+    }, { passive: true })
+  );
+  addEventListener("click", (e) => {
+    if (e.target.closest("a, button") || fx.cur === null || fx.cur > 0.4) return;
+    petHop(1.8);
+    sfx.chirp(520, 820);
+  });
+
+  function petStep(dt, cur, at) {
+    const p = pet;
+    p.t += dt;
+    p.idle += dt;
+    p.sleepy += ((p.idle > 12 ? 1 : 0) - p.sleepy) * (1 - Math.exp(-dt * (p.idle > 12 ? 0.5 : 4)));
+
+    // Wave hello once it has gathered, goodbye as it leaves, hello again on return.
+    if (!p.introWaved && p.t > 2.3) { p.introWaved = true; petWave(); }
+    if (cur >= 0.12 && p.lastCur < 0.12) petWave();
+    if (cur < 0.05 && p.lastCur >= 0.05 && p.greeted) petWave();
+    if (cur < 0.05) p.greeted = true;
+    p.lastCur = cur;
+
+    // Blink: the i's dot is its eye. Sometimes a double blink; half-shut when sleepy.
+    if (p.t > p.nextBlink) {
+      p.blinkT = 0;
+      p.nextBlink = p.t + (Math.random() < 0.2 ? 0.28 : 2.4 + Math.random() * 3.6 + p.sleepy * 3);
+    }
+    let lid = 1;
+    if (p.blinkT >= 0) {
+      lid = p.blinkT < 0.08 ? 1 - (p.blinkT / 0.08) * 0.85 : p.blinkT < 0.2 ? 0.15 + ((p.blinkT - 0.08) / 0.12) * 0.85 : 1;
+      p.blinkT = p.blinkT >= 0.2 ? -1 : p.blinkT + dt;
+    }
+    p.eye = lid * (1 - 0.55 * p.sleepy);
+
+    // Where is the cursor, relative to the character?
+    const onScreen = mouse.x > -1e3;
+    const dx = onScreen ? (mouse.x - at.x) / Math.max(at.s, 1) : 0;
+    const dy = onScreen ? (mouse.y - at.y) / Math.max(at.s, 1) : 0;
+    const near = onScreen && Math.hypot(dx, dy) < 1.8;
+    const speed = Math.hypot(mouse.vx, mouse.vy);
+    if (near && !p.wasNear && p.awayFor > 3) petWave();
+    p.awayFor = near ? 0 : p.awayFor + dt;
+    p.wasNear = near;
+
+    // Startled by a fast swipe close by: jump, eye pops, shake, lean away.
+    if (near && speed > 1400 && p.t - p.startleAt > 2) {
+      p.startleAt = p.t;
+      p.jitter = 0.035; p.dv += 2.2; p.lv -= Math.sign(dx || 1) * 1.6;
+      petHop(1.1);
+      sfx.chirp(880, 1320);
+    }
+    p.jitter *= Math.exp(-dt * 4);
+
+    // Random happy hops while awake.
+    if (p.t > p.nextHop) { if (p.sleepy < 0.3) { petHop(0.9); sfx.chirp(500, 700); } p.nextHop = p.t + 6 + Math.random() * 8; }
+    if (p.hopAt >= 0 && p.t >= p.hopAt) { p.hv += 2.4 * p.pendingHop; p.hopAt = -1; }
+    p.hv -= 9.8 * dt;
+    p.hop += p.hv * dt;
+    if (p.hop < 0) { if (p.hv < -0.6) p.sv -= Math.abs(p.hv) * 0.22; p.hop = 0; p.hv = 0; }   // landing squash
+
+    // Springs: body stretch (breathing), lean (looking), eye lift (follow-through).
+    const breathe = 1 + (0.022 + 0.022 * p.sleepy) * Math.sin(p.t * (2.2 - 1.1 * p.sleepy));
+    const spring = (x, v, target, k, d) => { v += (-(x - target) * k - v * d) * dt; return [x + v * dt, v]; };
+    [p.sy, p.sv] = spring(p.sy, p.sv, breathe, 120, 9);
+    const curious = near && speed < 300 ? 1.5 : 1;
+    const look = Math.max(-0.3, Math.min(0.3, dx * 0.12 * curious)) + 0.12 * p.sleepy;
+    [p.lean, p.lv] = spring(p.lean, p.lv, look, 40, 7);
+    const eyeLift = (onScreen ? Math.max(-0.05, Math.min(0.07, -dy * 0.05)) : 0) + (near && speed < 300 ? 0.04 : 0) - 0.14 * p.sleepy - p.hv * 0.02;
+    [p.dotY, p.dv] = spring(p.dotY, p.dv, eyeLift, 60, 5);
+
+    // Wave: the arm swings out and back for about 1.6 s.
+    if (p.waveT >= 0 && p.waveT <= 1.6) {
+      const env = Math.sin(Math.PI * p.waveT / 1.6);
+      p.wave = (0.22 + 0.42 * Math.sin(p.waveT * 10)) * env;
+      p.waveT += dt;
+    } else p.wave *= Math.exp(-dt * 6);
+  }
 
   // Camera choreography: each scroll transition flies its own path, then settles
   // back to a readable front view once the next mascot has formed.
@@ -580,12 +960,34 @@
 
     mouse.sx += (mouse.nx - mouse.sx) * (1 - Math.exp(-dt * 3));
     // Cursor velocity (px per frame-ish), smoothed and capped, for the wake.
+    // Cursor speed in px per second, so the push feels the same at 60 Hz and 120 Hz.
     const jump = Math.abs(mouse.x - mouse.px) > 400 || Math.abs(mouse.y - mouse.py) > 400;
-    const k2 = 1 - Math.exp(-dt * 8);
-    mouse.vx += ((jump ? 0 : Math.max(-60, Math.min(60, mouse.x - mouse.px))) - mouse.vx) * k2;
-    mouse.vy += ((jump ? 0 : Math.max(-60, Math.min(60, mouse.y - mouse.py))) - mouse.vy) * k2;
+    const ivx = jump ? 0 : (mouse.x - mouse.px) / Math.max(dt, 1e-3);
+    const ivy = jump ? 0 : (mouse.y - mouse.py) / Math.max(dt, 1e-3);
+    const k2 = 1 - Math.exp(-dt * 14);
+    mouse.vx += (Math.max(-3000, Math.min(3000, ivx)) - mouse.vx) * k2;
+    mouse.vy += (Math.max(-3000, Math.min(3000, ivy)) - mouse.vy) * k2;
     mouse.px = mouse.x;
     mouse.py = mouse.y;
+    // The push is driven by movement, not position. It rises at once as the cursor
+    // enters or moves (full strength from a gentle 180 px/s), then fades slowly at rest.
+    const cursorSpeed = Math.hypot(ivx, ivy);
+    const stir = jump && mouse.x > -1e3 ? 1 : Math.min(1, cursorSpeed / 180);
+    mouse.push = Math.max(stir, mouse.push * Math.exp(-dt * RETURN_RATE));
+    // Record the cursor's path; each point's push fades out over TRAIL_LIFE seconds.
+    trailClock += dt;
+    if (trailClock >= TRAIL_LIFE / TRAIL_N && mouse.x > -1e3) {
+      trailClock = 0;
+      trail.unshift({ x: mouse.x, y: mouse.y, e: mouse.push, age: 0 });
+      trail.length = Math.min(trail.length, TRAIL_N - 1);
+    }
+    trailData.fill(0);
+    trailData.set([mouse.x * dpr, mouse.y * dpr, mouse.x > -1e3 ? mouse.push : 0], 0);
+    trail.forEach((t, i) => {
+      t.age += dt;
+      const w = t.e * Math.exp(-t.age * RETURN_RATE) * Math.max(0, Math.min(1, (TRAIL_LIFE - t.age) / 0.35));
+      trailData.set([t.x * dpr, t.y * dpr, w], (i + 1) * 3);
+    });
     mouse.sy += (mouse.ny - mouse.sy) * (1 - Math.exp(-dt * 3));
 
     const a = shapeNames[k], b = shapeNames[k + 1];
@@ -616,12 +1018,32 @@
     gl.uniform1f(loc.uSize, STACKED.matches ? 1.15 : 1.3);
     // A chase camera never sits perfectly still on its subject.
     const chase = reduce ? 0 : (a === "plane" ? 1 - e : 0) + (b === "plane" ? e : 0);
+    fx.cur = cur;
+    fx.k = k;
+    fx.f = f;
+    fx.s = Math.sin(Math.PI * f) * (reduce ? 0 : amp);
+    fx.yaw = FLIGHTS[k % FLIGHTS.length].yaw * fx.s;
+    fx.dist = cam.dist;
+    fx.fly = chase;
+    fx.push = mouse.push;
+    fx.cursorSpeed = Math.hypot(mouse.vx, mouse.vy);
+    fx.mx = mouse.x > -1e3 ? mouse.x / W : 0.5;
     const driftX = chase * (Math.sin(time * 0.6) * 10 + Math.sin(time * 1.7) * 3);
     const driftY = chase * (Math.sin(time * 0.9) * 8 + Math.cos(time * 2.1) * 2);
     gl.uniform2f(loc.uCenter, (lerp(pa.x, pb.x, e) + driftX) * dpr, (lerp(pa.y, pb.y, e) + driftY) * dpr);
     gl.uniform2f(loc.uRes, canvas.width, canvas.height);
     gl.uniform2f(loc.uMouse, mouse.x * dpr, mouse.y * dpr);
-    gl.uniform2f(loc.uMouseVel, mouse.vx * dpr, mouse.vy * dpr);
+    gl.uniform2f(loc.uMouseVel, (mouse.vx / 60) * dpr, (mouse.vy / 60) * dpr);
+    gl.uniform1f(loc.uPush, mouse.push);
+    gl.uniform3fv(loc.uTrail, trailData);
+    // The "hi" is only alive while it is on screen; off screen it costs nothing.
+    const hiShown = (a === "hi" ? 1 - f : 0) + (b === "hi" ? f : 0);
+    const alive = !reduce && hiShown > 0.01;
+    if (alive) petStep(dt, cur, placement(shapeNames.indexOf("hi")));
+    gl.uniform1f(loc.uHiA, alive && a === "hi" ? 1 : 0);
+    gl.uniform1f(loc.uHiB, alive && b === "hi" ? 1 : 0);
+    gl.uniform4f(loc.uPet, pet.sy, pet.lean, pet.hop, pet.jitter);
+    gl.uniform3f(loc.uPet2, pet.dotY, pet.eye, pet.wave);
     gl.uniform3fv(loc.uA1, hex(la.c[0]));
     gl.uniform3fv(loc.uA2, hex(la.c[1]));
     gl.uniform3fv(loc.uB1, hex(lb.c[0]));
