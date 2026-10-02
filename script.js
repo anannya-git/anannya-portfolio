@@ -21,7 +21,6 @@
     let ctx = null, on = false, nodes = null, loopId = 0;
     let lastY = scrollY, lastT = performance.now(), formed = null;
     const NOTES = [220, 246.94, 293.66, 329.63, 392];   // A minor pentatonic, one per section
-    const stored = () => { try { return localStorage.getItem("sound") === "on"; } catch { return false; } };
     const store = (v) => { try { localStorage.setItem("sound", v ? "on" : "off"); } catch {} };
 
     function noiseBuffer(seconds) {
@@ -40,6 +39,15 @@
     function filter(type, freq, q = 0.7) { const f = ctx.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q; return f; }
     function gain(v = 0) { const g = ctx.createGain(); g.gain.value = v; return g; }
     const set = (param, v, tc = 0.12) => param.setTargetAtTime(v, ctx.currentTime, tc);
+    // Continuous layers are retargeted only when a value moves, so the audio thread
+    // is not handed a new automation event for every parameter on every frame.
+    const last = new Map();
+    const setIf = (param, v, tc) => {
+      const prev = last.get(param);
+      if (prev !== undefined && Math.abs(prev - v) <= Math.max(1e-4, Math.abs(prev) * 0.01)) return;
+      last.set(param, v);
+      set(param, v, tc);
+    };
 
     function build() {
       ctx = new AC();
@@ -107,32 +115,33 @@
 
     function loop(now) {
       loopId = requestAnimationFrame(loop);
+      if (now - lastT < 32) return;          // 30 Hz is plenty: every change is smoothed anyway
       const dt = Math.max(0.001, (now - lastT) / 1000);
       lastT = now;
       const v = Math.abs(scrollY - lastY) / dt / innerHeight;   // screens per second
       lastY = scrollY;
       const { windBand, windGain, sparkBand, sparkGain, sparkPan, flightGain, padFilter } = nodes;
-      set(windGain.gain, Math.min(0.17, v * 0.07), 0.08);
-      set(windBand.frequency, 320 + Math.min(v, 4) * 520, 0.1);
+      setIf(windGain.gain, Math.min(0.17, v * 0.07), 0.08);
+      setIf(windBand.frequency, 320 + Math.min(v, 4) * 520, 0.1);
       const stir = fx.push * Math.min(1, fx.cursorSpeed / 700);
-      set(sparkGain.gain, Math.min(0.012, stir * 0.012), 0.12);
-      set(sparkBand.frequency, 3800 + Math.min(fx.cursorSpeed, 1500) * 0.4, 0.15);
+      setIf(sparkGain.gain, Math.min(0.012, stir * 0.012), 0.12);
+      setIf(sparkBand.frequency, 3800 + Math.min(fx.cursorSpeed, 1500) * 0.4, 0.15);
       if (sparkPan.pan) set(sparkPan.pan, (fx.mx - 0.5) * 1.4, 0.1);
-      set(flightGain.gain, fx.fly * 0.06, 0.4);
+      setIf(flightGain.gain, fx.fly * 0.06, 0.4);
       // Everything below follows scroll position, so it plays backwards when scrolling up.
       const { morphBand, morphGain, morphPan, toneFilter, tones } = nodes;
       const near = 4 / fx.dist;                                   // >1 when the camera pushes in
       // A soft, dark breath of air rather than grit: low-passed and kept well under the music.
-      set(morphGain.gain, Math.min(0.07, fx.s * 0.045 * near), 0.12);
-      set(morphBand.frequency, Math.min(1400, 380 + fx.f * 700 * near), 0.12);
+      setIf(morphGain.gain, Math.min(0.07, fx.s * 0.045 * near), 0.12);
+      setIf(morphBand.frequency, Math.min(1400, 380 + fx.f * 700 * near), 0.12);
       if (morphPan.pan) set(morphPan.pan, Math.max(-0.9, Math.min(0.9, Math.sin(fx.yaw) * 0.9)), 0.08);
       const e = fx.f * fx.f * (3 - 2 * fx.f);
       const pitch = (NOTES[fx.k % NOTES.length] + (NOTES[(fx.k + 1) % NOTES.length] - NOTES[fx.k % NOTES.length]) * e) / 2;
-      tones.forEach((o) => set(o.frequency, pitch, 0.06));
-      set(toneFilter.frequency, 500 + 900 * Math.min(1.8, near) + fx.s * 600, 0.08);
+      tones.forEach((o) => setIf(o.frequency, pitch, 0.06));
+      setIf(toneFilter.frequency, 500 + 900 * Math.min(1.8, near) + fx.s * 600, 0.08);
       // The drone opens up as the visitor goes deeper into the site.
       const cur = fx.cur ?? Math.round(scrollY / innerHeight);
-      set(padFilter.frequency, 320 + cur * 70, 0.6);
+      setIf(padFilter.frequency, 320 + cur * 70, 0.6);
       const nearest = Math.round(cur);
       if (formed === null) formed = nearest;
       if (Math.abs(cur - nearest) < 0.06 && nearest !== formed) { formed = nearest; boom(nearest); }
@@ -143,7 +152,7 @@
       await ctx.resume();
       on = true;
       formed = null;
-      lastY = scrollY; lastT = performance.now();
+      lastY = scrollY; lastT = performance.now(); last.clear();
       nodes.master.gain.cancelScheduledValues(ctx.currentTime);
       set(nodes.master.gain, 0.8, 0.5);
       cancelAnimationFrame(loopId);
@@ -163,12 +172,19 @@
       toggle.classList.toggle("is-on", on);
     }
     toggle.addEventListener("click", () => { const next = !on; store(next); next ? enable() : disable(); });
-    // A returning visitor who chose sound gets it back on their first interaction.
-    if (stored()) {
-      const resume = (e) => { if (!on && !toggle.contains(e.target)) enable(); };
-      addEventListener("pointerdown", resume, { once: true, capture: true });
-      addEventListener("keydown", resume, { once: true, capture: true });
+    // Sound comes on with the visitor's first interaction anywhere, unless they
+    // turned it off before. Browsers only let audio start from a real gesture
+    // (click, tap, key); a scroll counts once the page has had one.
+    const offByChoice = () => { try { return localStorage.getItem("sound") === "off"; } catch { return false; } };
+    const WAKE = ["pointerup", "click", "keydown", "touchend", "wheel", "scroll"];
+    function wake(e) {
+      if (on || offByChoice() || toggle.contains(e.target)) return stopWaking();
+      const gesture = e.type !== "wheel" && e.type !== "scroll";
+      if (!gesture && !(navigator.userActivation && navigator.userActivation.hasBeenActive)) return;
+      enable().then(() => { if (ctx.state === "running") stopWaking(); });
     }
+    function stopWaking() { WAKE.forEach((t) => removeEventListener(t, wake, true)); }
+    if (!offByChoice()) WAKE.forEach((t) => addEventListener(t, wake, { capture: true, passive: true }));
     document.addEventListener("visibilitychange", () => {
       if (!ctx || !on) return;
       document.hidden ? ctx.suspend() : ctx.resume();
@@ -215,39 +231,54 @@
     captions: [...section.querySelectorAll(".fig, .scroll-cue")],
   }));
   const smooth = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
-  let textQueued = false;
+  let textQueued = false, sidesDirty = true, introAway = false;
+  const written = new WeakMap();
+  // Assign styles only when they change: at rest this touches nothing.
+  function paintText(el, opacity, transform) {
+    const prev = written.get(el);
+    if (prev && prev[0] === opacity && prev[1] === transform) return;
+    written.set(el, [opacity, transform]);
+    el.style.opacity = opacity;
+    el.style.transform = transform;
+  }
   function placeText() {
     textQueued = false;
     const vh = innerHeight, vw = innerWidth, still = reduceQuery.matches;
     const travel = Math.min(vw * 0.42, 640);
+    // All layout reads happen before any style writes.
     const reads = blocks.map((b) => b.section.getBoundingClientRect());
+    if (sidesDirty) {
+      blocks.forEach((b) => (b.captionSides = b.captions.map((el) => (el.offsetLeft + el.offsetWidth / 2 < vw / 2 ? -1 : 1))));
+      sidesDirty = false;
+    }
     blocks.forEach((b, s) => {
       const r = reads[s];
       // 0 while the section fills the screen; positive as it sits below (entering),
       // negative as it leaves upward, in viewport heights.
       const c = r.top > 0 ? r.top / vh : r.bottom < vh ? (r.bottom - vh) / vh : 0;
+      if (s === 0 && introAway !== Math.abs(c) > 0.6) {
+        introAway = !introAway;
+        root.classList.toggle("intro-away", introAway);   // pauses the intro's CSS loops
+      }
       const n = b.items.length;
       b.items.forEach((el, i) => {
-        // Stagger: on the way in the first item leads; on the way out the top item leaves first.
         // The stagger grows with distance, so a section a pixel off its rest spot stays fully shown.
         const lag = 0.035 * Math.min(1, Math.abs(c) / 0.12);
+        // Stagger: on the way in the first item leads; on the way out the top item leaves first.
         const ci = c > 0 ? c + i * lag : c < 0 ? c - (n - 1 - i) * lag : 0;
         const shown = 1 - smooth(0.06, 0.46, Math.abs(ci));
-        el.style.opacity = shown.toFixed(3);
-        el.style.transform = still || shown > 0.999 ? "" : `translate3d(${(b.dir * travel * (1 - shown) * (1 - shown)).toFixed(1)}px, 0, 0)`;
+        paintText(el, shown.toFixed(3), still || shown > 0.999 ? "" : `translate3d(${(b.dir * travel * (1 - shown) * (1 - shown)).toFixed(1)}px, 0, 0)`);
       });
       // Captions (SCROLL, FIG.) leave through their own nearest edge, a beat after the copy.
-      b.captions.forEach((el) => {
-        const side = el.offsetLeft + el.offsetWidth / 2 < vw / 2 ? -1 : 1;
+      b.captions.forEach((el, i) => {
         const shown = 1 - smooth(0.04, 0.34, Math.abs(c));
-        el.style.opacity = shown.toFixed(3);
-        el.style.transform = still || shown > 0.999 ? "" : `translate3d(${(side * travel * 0.6 * (1 - shown) * (1 - shown)).toFixed(1)}px, 0, 0)`;
+        paintText(el, shown.toFixed(3), still || shown > 0.999 ? "" : `translate3d(${(b.captionSides[i] * travel * 0.6 * (1 - shown) * (1 - shown)).toFixed(1)}px, 0, 0)`);
       });
     });
   }
   const queueText = () => { if (!textQueued) { textQueued = true; requestAnimationFrame(placeText); } };
   addEventListener("scroll", queueText, { passive: true });
-  addEventListener("resize", queueText);
+  addEventListener("resize", () => { sidesDirty = true; queueText(); });
   placeText();
 
   const rail = document.querySelector(".rail");
@@ -554,7 +585,8 @@
     plane:  { c: ["#6e6e73", "#ffffff"], pitch: 0.85, roll: 0.15, yaw: -0.25, spin: 0, wobble: 0.2, bank: 0.14 },
   };
 
-  const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 255);
+  const hex = (h) => new Float32Array([1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 255));
+  for (const l of Object.values(LOOK)) l.rgb = l.c.map(hex);
 
   /* ---------- WebGL ---------- */
 
@@ -576,6 +608,7 @@
     uniform vec3 uPet2;   // eye (the i's dot): lift, openness; arm (h's stem): wave angle
     const int TRAIL = 16;
     uniform vec3 uTrail[TRAIL];
+    uniform float uTrailN;   // how many uTrail entries are active; 0 skips the push entirely
     uniform vec2 uCenter, uRes, uMouse, uMouseVel;
     uniform vec3 uA1, uA2, uB1, uB2;
     varying vec3 vColor;
@@ -658,7 +691,9 @@
       // (Summing them would let a slow or resting cursor pile faded pushes back up.)
       vec2 push = vec2(0.0);
       float best = 0.0;
-      for (int i = 0; i < TRAIL; i++) {
+      // A fixed-length loop the compiler can unroll; the whole block is skipped
+      // when the cursor has been still long enough that nothing is pushing.
+      if (uTrailN > 0.5) for (int i = 0; i < TRAIL; i++) {
         vec3 t = uTrail[i];
         if (t.z <= 0.001) continue;
         vec2 d = sp - t.xy;
@@ -671,7 +706,7 @@
         }
       }
       vec2 dm = sp - uMouse;
-      float wake = exp(-dot(dm, dm) / (r * r)) * uPush;
+      float wake = uPush > 0.001 ? exp(-dot(dm, dm) / (r * r)) * uPush : 0.0;
       sp += (push * 60.0 * uPx + uMouseVel * 0.45 * wake) * strength * uMotion;
       vec2 clip = sp / uRes * 2.0 - 1.0;
       gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
@@ -717,7 +752,7 @@
 
   const loc = {};
   ["aA", "aB", "aR", "aD"].forEach((n) => (loc[n] = gl.getAttribLocation(prog, n)));
-  ["uRotA", "uRotB", "uCam", "uDist", "uFlyA", "uFlyB", "uF", "uScatter", "uTime", "uMotion", "uScale", "uPx", "uSize", "uCenter", "uRes", "uMouse", "uMouseVel", "uPush", "uTrail", "uHiA", "uHiB", "uPet", "uPet2", "uA1", "uA2", "uB1", "uB2"]
+  ["uRotA", "uRotB", "uCam", "uDist", "uFlyA", "uFlyB", "uF", "uScatter", "uTime", "uMotion", "uScale", "uPx", "uSize", "uCenter", "uRes", "uMouse", "uMouseVel", "uPush", "uTrail", "uTrailN", "uHiA", "uHiB", "uPet", "uPet2", "uA1", "uA2", "uB1", "uB2"]
     .forEach((n) => (loc[n] = gl.getUniformLocation(prog, n)));
 
   const shapeNames = sections.map((s) => s.dataset.shape);
@@ -754,20 +789,16 @@
   gl.blendFunc(gl.ONE, gl.ONE);
   gl.clearColor(0, 0, 0, 1);
 
-  // Column-major rotation: Rx(pitch) · Ry(yaw) · Rz(roll).
-  function rotation(yaw, pitch, roll) {
-    const [cy, sy, cx, sx, cz, sz] = [Math.cos(yaw), Math.sin(yaw), Math.cos(pitch), Math.sin(pitch), Math.cos(roll), Math.sin(roll)];
-    const ry = [cy, 0, sy, 0, 1, 0, -sy, 0, cy];
-    const rx = [1, 0, 0, 0, cx, -sx, 0, sx, cx];
-    const rz = [cz, -sz, 0, sz, cz, 0, 0, 0, 1];
-    const mul = (a, b) => {
-      const o = new Array(9);
-      for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) o[r * 3 + c] = a[r * 3] * b[c] + a[r * 3 + 1] * b[3 + c] + a[r * 3 + 2] * b[6 + c];
-      return o;
-    };
-    const m = mul(mul(rx, ry), rz);
-    return new Float32Array([m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]);
+  // Column-major rotation: Rx(pitch) · Ry(yaw) · Rz(roll), written into `out`
+  // (preallocated, so the frame loop makes no garbage).
+  function rotation(yaw, pitch, roll, out = new Float32Array(9)) {
+    const cy = Math.cos(yaw), sy = Math.sin(yaw), cx = Math.cos(pitch), sx = Math.sin(pitch), cz = Math.cos(roll), sz = Math.sin(roll);
+    out[0] = cy * cz;                out[3] = -cy * sz;               out[6] = sy;
+    out[1] = cx * sz + sx * sy * cz; out[4] = cx * cz - sx * sy * sz; out[7] = -sx * cy;
+    out[2] = sx * sz - cx * sy * cz; out[5] = sx * cz + cx * sy * sz; out[8] = cx * cy;
+    return out;
   }
+  const rotA = new Float32Array(9), rotB = new Float32Array(9), camM = new Float32Array(9);
 
   let W = 0, H = 0, dpr = 1;
   function resize() {
@@ -804,7 +835,9 @@
 
   // Push is instant; the return is slower (RETURN_RATE per second, over TRAIL_LIFE).
   const TRAIL_N = 16, TRAIL_LIFE = 1.2, RETURN_RATE = 1.3;
-  const trail = [], trailData = new Float32Array(TRAIL_N * 3);
+  const trail = Array.from({ length: TRAIL_N - 1 }, () => ({ x: 0, y: 0, e: 0, age: 1e9 }));
+  const trailData = new Float32Array(TRAIL_N * 3);
+  let trailHead = 0, trailCount = 0;
   let trailClock = 0;
   const mouse = { x: -1e4, y: -1e4, nx: 0, ny: 0, sx: 0, sy: 0, px: -1e4, py: -1e4, vx: 0, vy: 0, push: 0 };
   addEventListener("pointermove", (e) => {
@@ -824,10 +857,35 @@
   // waves, hops, startles and dozes off. petStep only runs while it is on screen.
   const pet = {
     sy: 1, sv: 0, lean: 0, lv: 0, hop: 0, hv: 0, dotY: 0, dv: 0, eye: 1, wave: 0, jitter: 0,
-    t: 0, nextBlink: 3.2, blinkT: -1, waveT: -1, introWaved: false, nextHop: 6, pendingHop: 0, hopAt: -1,
+    act: null, t: 0, nextBlink: 3.2, blinkT: -1, waveT: -1, introWaved: false, nextHop: 6, pendingHop: 0, hopAt: -1,
     idle: 0, sleepy: 0, startleAt: -9, wasNear: false, awayFor: 0, lastCur: 0, greeted: false,
   };
-  const petHop = (power) => { pet.sv -= 0.5 * power; pet.pendingHop = power; pet.hopAt = pet.t + 0.12; };
+  // A hop is set by how high it should rise (in letter units), capped so it stays grounded.
+  const petHop = (height) => {
+    const h = Math.min(height, 0.16);
+    pet.sv -= 2.2 * h; pet.pendingHop = Math.sqrt(2 * 9.8 * h); pet.hopAt = pet.t + 0.12;
+  };
+
+  // The repertoire. Clicks and idle moments pick one at random, never repeating
+  // either of the last two, so it never does the same thing twice in a row.
+  const ACTS = {
+    hop:     () => { petHop(0.13); sfx.chirp(520, 760); },
+    wave:    () => petWave(),
+    wiggle:  () => { pet.act = { name: "wiggle", t: 0, len: 0.8 }; sfx.chirp(600, 520); },
+    nod:     () => { pet.dv -= 1.6; pet.sv -= 0.25; sfx.chirp(480, 400); },
+    stretch: () => { pet.act = { name: "stretch", t: 0, len: 1.2 }; sfx.chirp(380, 560); },
+    wink:    () => { pet.blinkT = 0; pet.nextBlink = pet.t + 0.26; sfx.chirp(900, 1100); },
+    dance:   () => { pet.act = { name: "dance", t: 0, len: 1.6, hops: 0 }; sfx.chirp(520, 780); },
+    peek:    () => { pet.act = { name: "peek", t: 0, len: 1.6 }; },
+  };
+  const recent = [];
+  function petReact() {
+    const pool = Object.keys(ACTS).filter((n) => !recent.includes(n));
+    const name = pool[Math.floor(Math.random() * pool.length)];
+    recent.push(name);
+    if (recent.length > 2) recent.shift();
+    ACTS[name]();
+  }
   const petWave = () => { if (pet.waveT < 0 || pet.waveT > 1.6) { pet.waveT = 0; sfx.chirp(440, 660); } };
   ["pointermove", "keydown", "wheel", "touchstart"].forEach((type) =>
     addEventListener(type, () => {
@@ -837,8 +895,7 @@
   );
   addEventListener("click", (e) => {
     if (e.target.closest("a, button") || fx.cur === null || fx.cur > 0.4) return;
-    petHop(1.8);
-    sfx.chirp(520, 820);
+    petReact();
   });
 
   function petStep(dt, cur, at) {
@@ -880,26 +937,41 @@
     if (near && speed > 1400 && p.t - p.startleAt > 2) {
       p.startleAt = p.t;
       p.jitter = 0.035; p.dv += 2.2; p.lv -= Math.sign(dx || 1) * 1.6;
-      petHop(1.1);
+      petHop(0.12);
       sfx.chirp(880, 1320);
     }
     p.jitter *= Math.exp(-dt * 4);
 
     // Random happy hops while awake.
-    if (p.t > p.nextHop) { if (p.sleepy < 0.3) { petHop(0.9); sfx.chirp(500, 700); } p.nextHop = p.t + 6 + Math.random() * 8; }
-    if (p.hopAt >= 0 && p.t >= p.hopAt) { p.hv += 2.4 * p.pendingHop; p.hopAt = -1; }
+    // Something different every 5-12 s while awake.
+    if (p.t > p.nextHop) { if (p.sleepy < 0.3) petReact(); p.nextHop = p.t + 5 + Math.random() * 7; }
+    if (p.hopAt >= 0 && p.t >= p.hopAt) { p.hv = p.pendingHop; p.hopAt = -1; }
     p.hv -= 9.8 * dt;
     p.hop += p.hv * dt;
     if (p.hop < 0) { if (p.hv < -0.6) p.sv -= Math.abs(p.hv) * 0.22; p.hop = 0; p.hv = 0; }   // landing squash
 
+    // The current act adds its own motion on top of the springs.
+    let actLean = 0, actStretch = 0, actEye = 0;
+    if (p.act) {
+      const a = p.act, env = Math.sin(Math.PI * Math.min(1, a.t / a.len));
+      if (a.name === "wiggle") actLean = 0.16 * Math.sin(a.t * 22) * env;
+      if (a.name === "stretch") { actStretch = 0.1 * env; actEye = 0.06 * env; }
+      if (a.name === "peek") actLean = 0.22 * Math.sin((a.t / a.len) * Math.PI * 2) * env;
+      if (a.name === "dance") {
+        actLean = 0.14 * Math.sin(a.t * 7.5) * env;
+        if (a.hops < 2 && a.t > 0.35 + a.hops * 0.6) { petHop(0.06); a.hops++; }
+      }
+      a.t += dt;
+      if (a.t >= a.len) p.act = null;
+    }
     // Springs: body stretch (breathing), lean (looking), eye lift (follow-through).
     const breathe = 1 + (0.022 + 0.022 * p.sleepy) * Math.sin(p.t * (2.2 - 1.1 * p.sleepy));
     const spring = (x, v, target, k, d) => { v += (-(x - target) * k - v * d) * dt; return [x + v * dt, v]; };
-    [p.sy, p.sv] = spring(p.sy, p.sv, breathe, 120, 9);
+    [p.sy, p.sv] = spring(p.sy, p.sv, breathe + actStretch, 120, 9);
     const curious = near && speed < 300 ? 1.5 : 1;
-    const look = Math.max(-0.3, Math.min(0.3, dx * 0.12 * curious)) + 0.12 * p.sleepy;
+    const look = Math.max(-0.3, Math.min(0.3, dx * 0.12 * curious)) + 0.12 * p.sleepy + actLean;
     [p.lean, p.lv] = spring(p.lean, p.lv, look, 40, 7);
-    const eyeLift = (onScreen ? Math.max(-0.05, Math.min(0.07, -dy * 0.05)) : 0) + (near && speed < 300 ? 0.04 : 0) - 0.14 * p.sleepy - p.hv * 0.02;
+    const eyeLift = (onScreen ? Math.max(-0.05, Math.min(0.07, -dy * 0.05)) : 0) + (near && speed < 300 ? 0.04 : 0) - 0.14 * p.sleepy - p.hv * 0.02 + actEye;
     [p.dotY, p.dv] = spring(p.dotY, p.dv, eyeLift, 60, 5);
 
     // Wave: the arm swings out and back for about 1.6 s.
@@ -929,7 +1001,7 @@
   function camera(k, f, amp) {
     const fl = FLIGHTS[k % FLIGHTS.length], s = Math.sin(Math.PI * f) * amp;
     const dist = Math.max(2.1, 4 + fl.dolly(s, f, amp));
-    return { m: rotation(fl.yaw * s, fl.pitch * s, 0), dist, zoom: fl.lens(s) };
+    return { m: rotation(fl.yaw * s, fl.pitch * s, 0, camM), dist, zoom: fl.lens(s) };
   }
   let cur = scrollT();
   let lastScroll = scrollY, speed = 0, time = 0, last = performance.now(), prevCur = cur, rate = 0;
@@ -978,31 +1050,41 @@
     trailClock += dt;
     if (trailClock >= TRAIL_LIFE / TRAIL_N && mouse.x > -1e3) {
       trailClock = 0;
-      trail.unshift({ x: mouse.x, y: mouse.y, e: mouse.push, age: 0 });
-      trail.length = Math.min(trail.length, TRAIL_N - 1);
+      trailHead = (trailHead + 1) % trail.length;
+      const t = trail[trailHead];
+      t.x = mouse.x; t.y = mouse.y; t.e = mouse.push; t.age = 0;
     }
-    trailData.fill(0);
-    trailData.set([mouse.x * dpr, mouse.y * dpr, mouse.x > -1e3 ? mouse.push : 0], 0);
-    trail.forEach((t, i) => {
+    // Pack the points that still push at the front; the rest are zeroed.
+    trailCount = 0;
+    if (mouse.x > -1e3 && mouse.push > 0.001) {
+      trailData[0] = mouse.x * dpr; trailData[1] = mouse.y * dpr; trailData[2] = mouse.push;
+      trailCount = 1;
+    }
+    for (const t of trail) {
       t.age += dt;
       const w = t.e * Math.exp(-t.age * RETURN_RATE) * Math.max(0, Math.min(1, (TRAIL_LIFE - t.age) / 0.35));
-      trailData.set([t.x * dpr, t.y * dpr, w], (i + 1) * 3);
-    });
+      if (w <= 0.001) continue;
+      const o = trailCount * 3;
+      trailData[o] = t.x * dpr; trailData[o + 1] = t.y * dpr; trailData[o + 2] = w;
+      trailCount++;
+    }
+    trailData.fill(0, trailCount * 3);
     mouse.sy += (mouse.ny - mouse.sy) * (1 - Math.exp(-dt * 3));
 
     const a = shapeNames[k], b = shapeNames[k + 1];
     const la = LOOK[a], lb = LOOK[b];
     // Scroll turns each mascot relative to its own resting pose, so poses never drift.
-    const look = (l, offset) => rotation(
+    const look = (l, offset, out) => rotation(
       l.yaw + l.spin * time + l.wobble * Math.sin(time * 0.5) + mouse.sx * 0.6 + offset * 0.4,
       l.pitch + mouse.sy * 0.3,
-      l.roll + (l.bank || 0) * Math.sin(time * 0.9)
+      l.roll + (l.bank || 0) * Math.sin(time * 0.9),
+      out
     );
 
     const pa = placement(k), pb = placement(k + 1), e = ease(f);
 
-    gl.uniformMatrix3fv(loc.uRotA, false, look(la, cur - k));
-    gl.uniformMatrix3fv(loc.uRotB, false, look(lb, cur - k - 1));
+    gl.uniformMatrix3fv(loc.uRotA, false, look(la, cur - k, rotA));
+    gl.uniformMatrix3fv(loc.uRotB, false, look(lb, cur - k - 1, rotB));
     const cam = camera(k, f, reduce ? 0 : amp);
     gl.uniformMatrix3fv(loc.uCam, false, cam.m);
     gl.uniform1f(loc.uDist, cam.dist);
@@ -1036,6 +1118,7 @@
     gl.uniform2f(loc.uMouseVel, (mouse.vx / 60) * dpr, (mouse.vy / 60) * dpr);
     gl.uniform1f(loc.uPush, mouse.push);
     gl.uniform3fv(loc.uTrail, trailData);
+    gl.uniform1f(loc.uTrailN, trailCount);
     // The "hi" is only alive while it is on screen; off screen it costs nothing.
     const hiShown = (a === "hi" ? 1 - f : 0) + (b === "hi" ? f : 0);
     const alive = !reduce && hiShown > 0.01;
@@ -1044,10 +1127,10 @@
     gl.uniform1f(loc.uHiB, alive && b === "hi" ? 1 : 0);
     gl.uniform4f(loc.uPet, pet.sy, pet.lean, pet.hop, pet.jitter);
     gl.uniform3f(loc.uPet2, pet.dotY, pet.eye, pet.wave);
-    gl.uniform3fv(loc.uA1, hex(la.c[0]));
-    gl.uniform3fv(loc.uA2, hex(la.c[1]));
-    gl.uniform3fv(loc.uB1, hex(lb.c[0]));
-    gl.uniform3fv(loc.uB2, hex(lb.c[1]));
+    gl.uniform3fv(loc.uA1, la.rgb[0]);
+    gl.uniform3fv(loc.uA2, la.rgb[1]);
+    gl.uniform3fv(loc.uB1, lb.rgb[0]);
+    gl.uniform3fv(loc.uB2, lb.rgb[1]);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, buffers[a]);
     gl.vertexAttribPointer(loc.aA, 3, gl.FLOAT, false, 0, 0);
