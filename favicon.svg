@@ -1,1 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="18" fill="#101d1c"/><path d="M18 48 30.5 15h4L47 48h-7.1l-2.6-7.3H27.4L24.8 48Zm11.6-13h7.5l-3.8-11Z" fill="#f5f4ee"/><circle cx="47" cy="17" r="4" fill="#c5f26b"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <style>
+    path { fill: #000; }
+    @media (prefers-color-scheme: dark) { path { fill: #fff; } }
+  </style>
+  <!-- One shape: a filled circle with a see-through A cut out of it (even-odd fill). -->
+  <path fill-rule="evenodd" d="M0 16a16 16 0 1 0 32 0a16 16 0 1 0 -32 0Z M13.9 7h4.2l6.5 18h-3.9l-1.4-4h-6.6l-1.4 4h-3.9Z M16 11.6l2.2 6.2h-4.4Z"/>
+</svg>
