@@ -63,6 +63,70 @@
   addEventListener("scroll", updateChrome, { passive: true });
   updateChrome();
 
+  /* ---------- Cushioned snap ---------- */
+
+  // Once a scroll (including trackpad or touch momentum) has fully come to rest
+  // near a section edge, glide onto it on a critically damped spring: it leaves
+  // from standstill, eases in and lands softly, with no overshoot.
+  const SNAP_RANGE = 0.35;   // fraction of the viewport within which we snap
+  const REST_MS = 180;       // quiet time that means the scroll has stopped
+  const OMEGA = 6.5;         // spring speed; about a second to settle
+  let restTimer = 0, gliding = false, glideFrame = 0;
+
+  function stopGlide() {
+    if (!gliding) return;
+    gliding = false;
+    cancelAnimationFrame(glideFrame);
+  }
+  // Real input cancels a glide. The faint tail of trackpad momentum does not.
+  addEventListener("wheel", (e) => { if (Math.abs(e.deltaY) >= 6) stopGlide(); }, { passive: true });
+  ["touchstart", "pointerdown", "keydown"].forEach((type) => addEventListener(type, stopGlide, { passive: true }));
+
+  function snapPoint() {
+    const y = scrollY, max = document.documentElement.scrollHeight - innerHeight;
+    const points = [];
+    for (const s of sections) {
+      points.push(s.offsetTop);
+      // A section taller than the screen can also settle on its bottom edge.
+      if (s.offsetHeight > innerHeight + 1) points.push(s.offsetTop + s.offsetHeight - innerHeight);
+    }
+    let best = null;
+    for (const p of points) {
+      const q = Math.min(Math.max(0, p), max);
+      if (best === null || Math.abs(q - y) < Math.abs(best - y)) best = q;
+    }
+    return best !== null && Math.abs(best - y) <= innerHeight * SNAP_RANGE ? best : null;
+  }
+
+  function glideTo(target) {
+    const from = scrollY, dist = target - from, t0 = performance.now();
+    gliding = true;
+    const step = (now) => {
+      if (!gliding) return;
+      const t = (now - t0) / 1000;
+      // Critically damped spring from rest: x(t) = 1 - (1 + wt) e^(-wt).
+      const k = 1 - (1 + OMEGA * t) * Math.exp(-OMEGA * t);
+      if (Math.abs(dist) * (1 - k) < 0.4) {
+        scrollTo({ top: target, behavior: "instant" });
+        gliding = false;
+        return;
+      }
+      scrollTo({ top: from + dist * k, behavior: "instant" });
+      glideFrame = requestAnimationFrame(step);
+    };
+    glideFrame = requestAnimationFrame(step);
+  }
+
+  addEventListener("scroll", () => {
+    if (gliding) return;
+    clearTimeout(restTimer);
+    restTimer = setTimeout(() => {
+      if (reduceQuery.matches) return;
+      const target = snapPoint();
+      if (target !== null && Math.abs(target - scrollY) > 1) glideTo(target);
+    }, REST_MS);
+  }, { passive: true });
+
   /* ---------- Shapes: every mascot is N points in roughly [-1.2, 1.2]^3 ---------- */
 
   // Stacked layout (phones, upright tablets). Keep in sync with the stacked media query in styles.css.
@@ -451,7 +515,7 @@
     // Wide screens keep the mascot inside the same centred frame as the copy.
     const frame = Math.max(0, (W - 1680) / 2), cw = W - 2 * frame;
     const at = W <= 1100 ? (right ? 0.74 : 0.26) : (right ? 0.72 : 0.28);
-    return { x: frame + cw * at, y: H * 0.52, s: Math.min(cw * (W <= 1100 ? 0.15 : 0.16), H * 0.29) };
+    return { x: frame + cw * at, y: H * 0.5 + 8, s: Math.min(cw * (W <= 1100 ? 0.15 : 0.16), H * 0.29) };
   }
 
   const mouse = { x: -1e4, y: -1e4, nx: 0, ny: 0, sx: 0, sy: 0, px: -1e4, py: -1e4, vx: 0, vy: 0 };
@@ -469,16 +533,23 @@
   // Camera choreography: each scroll transition flies its own path, then settles
   // back to a readable front view once the next mascot has formed.
   // Every path returns to the front by itself, so a flight can be scaled down
-  // (fast scrolling) without leaving the camera off-axis.
+  // (fast scrolling) without leaving the camera off-axis. Each flight also has its
+  // own zoom: dolly (camera distance) and lens (screen scale) move separately.
   const FLIGHTS = [
-    { yaw: 0.7, pitch: 1.25 },   // swoop over the top
-    { yaw: 2.6, pitch: 0.25 },   // swing round to the back
-    { yaw: -0.8, pitch: -1.15 }, // dive underneath
-    { yaw: -2.4, pitch: 0.6 },   // swing round the other way, from above
+    // swoop over the top, pulling back wide to reveal the space, then gliding in
+    { yaw: 0.7, pitch: 1.25, dolly: (s) => 2.4 * s, lens: (s) => 1 - 0.18 * s },
+    // swing round to the back, pushing in close enough to fly through the particles
+    { yaw: 2.6, pitch: 0.25, dolly: (s) => -1.7 * s, lens: () => 1 },
+    // dive underneath with a dolly zoom: the camera backs off while the lens zooms in,
+    // so the subject holds its size and the perspective stretches
+    { yaw: -0.8, pitch: -1.15, dolly: (s) => 3.2 * s, lens: (s) => 1 + 0.62 * s },
+    // circle from above: punch in, then pull out wide as the plane arrives
+    { yaw: -2.4, pitch: 0.6, dolly: (s, f, amp) => -1.4 * Math.sin(TAU * f) * amp, lens: () => 1 },
   ];
   function camera(k, f, amp) {
     const fl = FLIGHTS[k % FLIGHTS.length], s = Math.sin(Math.PI * f) * amp;
-    return { m: rotation(fl.yaw * s, fl.pitch * s, 0), dist: 4 - 1.2 * s };
+    const dist = Math.max(2.1, 4 + fl.dolly(s, f, amp));
+    return { m: rotation(fl.yaw * s, fl.pitch * s, 0), dist, zoom: fl.lens(s) };
   }
   let cur = scrollT();
   let lastScroll = scrollY, speed = 0, time = 0, last = performance.now(), prevCur = cur, rate = 0;
@@ -539,7 +610,8 @@
     gl.uniform1f(loc.uScatter, (reduce ? 0 : speed) + intro);
     gl.uniform1f(loc.uTime, time);
     gl.uniform1f(loc.uMotion, reduce ? 0 : 1);
-    gl.uniform1f(loc.uScale, lerp(pa.s * (la.size || 1), pb.s * (lb.size || 1), e) * dpr);
+    // A nearer camera makes the scene bigger (dolly); the lens zoom applies on top.
+    gl.uniform1f(loc.uScale, lerp(pa.s * (la.size || 1), pb.s * (lb.size || 1), e) * dpr * cam.zoom * (4 / cam.dist));
     gl.uniform1f(loc.uPx, dpr);
     gl.uniform1f(loc.uSize, STACKED.matches ? 1.15 : 1.3);
     // A chase camera never sits perfectly still on its subject.
