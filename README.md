@@ -2,7 +2,7 @@
 
 A responsive static portfolio for Anannya Barman, Product Manager. The site uses plain HTML, CSS, and JavaScript, so GitHub Pages can publish it directly without a build step.
 
-A full-screen WebGL particle field sits behind the page (`script.js`). Each section names a mascot with `data-shape` (`orb`, `bars`, `bulb`, `house`, `knot`, `rocket`, `plane`) and a side with `data-side`; as you scroll, the particles scatter and regather into the next section's mascot. With `prefers-reduced-motion` the mascots switch without animation, and without WebGL the page falls back to a static gradient.
+A full-screen WebGL particle field sits behind the page (`script.js`). Each section names a mascot with `data-shape` (`hi`, `bars`, `rocket`, `knot`, `plane`) and a side with `data-side`; as you scroll, the particles scatter and regather into the next section's mascot. With `prefers-reduced-motion` the mascots switch without animation, and without WebGL the page falls back to a static gradient.
 
 ## Preview locally
 
