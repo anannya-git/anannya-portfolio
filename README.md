@@ -4,6 +4,15 @@ A responsive static portfolio for Anannya Barman, Product Manager. The site uses
 
 A full-screen WebGL particle field sits behind the page (`script.js`). Each section names a mascot with `data-shape` (`hi`, `bars`, `rocket`, `knot`, `plane`) and a side with `data-side`; as you scroll, the particles scatter and regather into the next section's mascot. With `prefers-reduced-motion` the mascots switch without animation, and without WebGL the page falls back to a static gradient.
 
+The intro's `hi` is a small character (it breathes, blinks, waves, hops and reacts to the cursor) that only runs while it is on screen. Sound is synthesised in the browser with Web Audio, starts on the visitor's first interaction, follows the scroll, and can be turned off with the header toggle; that choice is remembered.
+
+## Maintaining
+
+- **Cache versions:** `index.html` loads `styles.css?v=…` and `script.js?v=…`. Change the `v` value whenever either file changes, or returning visitors keep the cached copy. `favicon.svg?v=…` works the same way.
+- **Resume:** the header button opens `Anannya_CV.pdf`. Replace that file to update it.
+- **Link previews:** `og-image.jpg` (1200 × 630) is the image shown when the site is shared.
+- **Favicon:** `favicon.svg` is a circle with the A cut out, black in light mode and white in dark mode.
+
 ## Preview locally
 
 Open `index.html` in a browser, or run a local static server from this folder:
